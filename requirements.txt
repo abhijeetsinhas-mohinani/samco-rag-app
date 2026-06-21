@@ -1,0 +1,36 @@
+# Core
+requests>=2.28.0
+python-dotenv>=1.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# FastAPI
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Document Parsing
+python-docx>=0.8.11
+pdfplumber>=0.9.0
+olefile>=0.46
+mammoth>=1.6.0
+xlrd>=2.0.1
+openpyxl>=3.1.0
+
+# PDF Parsing — Docling Parse (primary, accurate heading/TOC extraction)
+docling-parse>=0.1.0
+
+# DOCX Parsing — Docling backend (better heading detection + table extraction)
+docling-slim>=0.1.0
+docling-core>=0.1.0
+lxml>=4.9.0
+
+# Embeddings & Vector Store
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+
+# Sparse Retrieval
+rank-bm25>=0.2.2
+
+# Azure Blob Storage (optional — only if using blob ingestion)
+azure-storage-blob>=12.14.0

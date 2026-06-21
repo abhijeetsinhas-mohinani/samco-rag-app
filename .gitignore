@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+
+# Environment variables
+.env
+
+# Output/debug files
+chunks_output.txt
+debug_chunks_to_llm.txt
+
+# FAISS temporary files you don't want in GitHub
+faiss_temp/failed_documents.txt
+faiss_temp/ingested_manifest.json
+
+# Optional OS files
+.DS_Store
+Thumbs.db
+
+# VS Code settings (optional)
+.vscode/
