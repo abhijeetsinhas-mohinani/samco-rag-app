@@ -1,4 +1,3 @@
-
 import os
 import io
 import re
@@ -105,7 +104,7 @@ FUZZY_THRESHOLD_SHORT          = float(os.getenv("FUZZY_THRESHOLD_SHORT", "0.80"
 MAX_GENERIC_MATCHES            = int(os.getenv("MAX_GENERIC_MATCHES", "3"))
 # ↑ If a query matches this many DIFFERENT documents (not versions of the
 #   same doc), the filter stays OFF — the query is too generic.
-#   e.g. "policy" would match 7+ docs → filter OFF.
+#   e.g. "policy" would match 7+ docs -> filter OFF.
 
 # --- Code Prefix / Suffix Regexes for Document Name Cleaning ---
 # Strips corporate doc-code prefixes like: MG-CSS-GL-IT-001_, FS_PRP_08,
@@ -405,6 +404,7 @@ class DocumentProcessor:
         ".odt":  "odt",
         ".rtf":  "rtf",
         ".xlsx": "xlsx",
+        ".xlsm": "xlsx",
         ".xls":  "xls_legacy",
         ".csv":  "csv",
         ".txt":  "txt",
@@ -1067,10 +1067,10 @@ class DocumentProcessor:
 
         Problem: The heading-based section builder can miss entire pages
         if no heading is detected on that page. For example:
-          - Page 1: H1 detected → section created
-          - Page 2: Text under H1 → included in page 1's section
-          - Page 3: No heading, text didn't get grouped → MISSING
-          - Page 4: No heading, text didn't get grouped → MISSING
+          - Page 1: H1 detected -> section created
+          - Page 2: Text under H1 -> included in page 1's section
+          - Page 3: No heading, text didn't get grouped -> MISSING
+          - Page 4: No heading, text didn't get grouped -> MISSING
 
         When a user asks about content on page 4, the LLM says "not
         enough context" because page 4 was never chunked.
@@ -1450,7 +1450,7 @@ class DocumentProcessor:
                 result = self._load_docx_bytes(docx_data, filename)
                 if result:
                     total_chars = sum(len(item["text"]) for item in result)
-                    logger.info(f"  .doc → .docx via LibreOffice ({total_chars} chars, {len(result)} sections)")
+                    logger.info(f"  .doc -> .docx via LibreOffice ({total_chars} chars, {len(result)} sections)")
                     return result
         except Exception as e:
             logger.warning(f"  LibreOffice conversion failed for {filename}: {e}")
@@ -2328,30 +2328,348 @@ class DocumentProcessor:
                  "heading_level": 0, "heading_text": "", "parent_path": ""}]
 
     def _load_xlsx_bytes(self, data: bytes, filename: str) -> List[Dict[str, Any]]:
-        xls = pd.ExcelFile(io.BytesIO(data))
+        """
+        Smart Excel parser for .xlsx files.
+
+        Handles the messy real-world Excel files in the SAMCO corpus:
+          - Merged cells (forward-filled via openpyxl)
+          - Auto-detects header row (scans rows 0-15)
+          - Filters empty/sparse sheets
+          - Detects section separator rows (e.g. "Corrugation - Related")
+          - Outputs markdown tables compatible with the existing chunker
+        """
+        import openpyxl
+
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
         content = []
-        for sheet_name in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet_name)
-            sheet_content = df.to_string(index=False)
-            if sheet_content.strip():
+
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+
+            # Step 1: Read cells into a grid with merged cells forward-filled
+            grid = self._xlsx_read_sheet_with_merges(ws)
+            if not grid:
+                continue
+
+            # Step 2: Count non-null cells — skip very sparse sheets
+            # Find columns that have at least one non-empty cell so that
+            # empty formatting columns (common in HACCP template sheets
+            # with 197+ columns but only 14 used) don't inflate sparsity.
+            active_cols = set()
+            filled_cells = 0
+            for row in grid:
+                for ci, cell in enumerate(row):
+                    if cell is not None and str(cell).strip():
+                        active_cols.add(ci)
+                        filled_cells += 1
+
+            if filled_cells < 8:
+                logger.info(f"  Excel: skipping sparse sheet '{sheet_name}' "
+                            f"({filled_cells} filled cells)")
+                continue
+
+            active_total = len(grid) * len(active_cols) if active_cols else 0
+            if active_total > 0 and filled_cells < 15 and filled_cells / active_total < 0.10:
+                logger.info(f"  Excel: skipping sparse sheet '{sheet_name}' "
+                            f"({filled_cells}/{active_total} active cells filled)")
+                continue
+
+            # Step 3: Auto-detect header row
+            header_idx = self._xlsx_detect_header_row(grid)
+            if header_idx is None:
+                logger.info(f"  Excel: no header detected in sheet '{sheet_name}', skipping")
+                continue
+
+            # Step 3b: Capture pre-header context (title, definitions, etc.)
+            pre_header_lines = []
+            for row in grid[:header_idx]:
+                texts = [
+                    str(c).strip() for c in row
+                    if c is not None and str(c).strip()
+                ]
+                unique_texts = list(dict.fromkeys(texts))
+                for t in unique_texts:
+                    if len(t) > 1 and t not in pre_header_lines:
+                        pre_header_lines.append(t)
+
+            headers = [
+                str(c).strip() if c is not None else ""
+                for c in grid[header_idx]
+            ]
+            data_rows = grid[header_idx + 1:]
+
+            # Step 4: Keep only columns that have a non-empty header
+            non_empty_cols = [i for i, h in enumerate(headers) if h]
+            if not non_empty_cols:
+                continue
+            headers = [headers[i] for i in non_empty_cols]
+            data_rows = [
+                [row[i] if i < len(row) else "" for i in non_empty_cols]
+                for row in data_rows
+            ]
+
+            # Step 5: Drop rows that are completely empty
+            data_rows = [
+                row for row in data_rows
+                if any(
+                    c is not None and str(c).strip()
+                    for c in row
+                )
+            ]
+            if not data_rows:
+                continue
+
+            # Step 6: Detect section separators and split
+            sections = self._xlsx_split_sections(headers, data_rows)
+
+            # Step 6b: Empty sections are footer metadata — merge into context
+            footer_lines = []
+            live_sections = []
+            for section_name, section_rows in sections:
+                if not section_rows and section_name:
+                    footer_lines.append(section_name)
+                else:
+                    live_sections.append((section_name, section_rows))
+            if footer_lines:
+                pre_header_lines.extend(footer_lines)
+            sections = live_sections
+
+            # Step 7: Convert each section into a markdown table
+            for section_name, section_rows in sections:
+                if not section_rows:
+                    continue
+
+                header_line = "| " + " | ".join(headers) + " |"
+                separator = "| " + " | ".join(["---"] * len(headers)) + " |"
+
+                md_lines = [header_line, separator]
+                for row in section_rows:
+                    cells = []
+                    for c in row:
+                        val = str(c).strip() if c is not None else ""
+                        val = val.replace("\n", " ").replace("|", "/")
+                        # Collapse vertically-written text like
+                        # "F I N A N C I A L" -> "FINANCIAL"
+                        if (len(val) >= 5
+                                and all(
+                                    (ch.isalpha() and len(ch) == 1)
+                                    or ch == " "
+                                    for ch in val)
+                                and " " in val):
+                            parts = val.split()
+                            if all(len(p) == 1 for p in parts):
+                                val = "".join(parts)
+                        cells.append(val)
+                    md_lines.append("| " + " | ".join(cells) + " |")
+
+                table_text = "\n".join(md_lines)
+
+                # Prepend sheet/section name so it is searchable
+                sn_stripped = sheet_name.strip()
+                if section_name:
+                    table_text = (
+                        f"[{sn_stripped} > {section_name}]\n" + table_text
+                    )
+                else:
+                    table_text = f"[{sn_stripped}]\n" + table_text
+
+                # Prepend pre-header context (title, definitions, etc.)
+                if pre_header_lines:
+                    context_block = "\n".join(pre_header_lines)
+                    table_text = context_block + "\n\n" + table_text
+
+                heading = section_name if section_name else sheet_name
+                parent = (
+                    f"{filename} > {sheet_name}"
+                    if section_name
+                    else ""
+                )
+
                 content.append({
-                    "text": sheet_content, "source_file": filename,
-                    "sheet_name": sheet_name, "doc_type": "tabular",
-                    "heading_level": 0, "heading_text": "", "parent_path": "",
+                    "text": table_text,
+                    "source_file": filename,
+                    "sheet_name": sheet_name,
+                    "doc_type": "tabular",
+                    "heading_level": 0,
+                    "heading_text": heading,
+                    "parent_path": parent,
                 })
+
+            if not sections:
+                logger.info(f"  Excel: sheet '{sheet_name}' produced no sections after parsing")
+
+        wb.close()
+
+        if content:
+            total_sections = len(content)
+            total_rows = sum(c["text"].count("\n") - 1 for c in content)
+            logger.info(
+                f"  Excel: {filename} -> {total_sections} section(s), "
+                f"~{total_rows} data rows"
+            )
         return content
+
+    # ------------------------------------------------------------------
+    # Excel helpers — merged cells, header detection, section splitting
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _xlsx_read_sheet_with_merges(ws) -> List[List[Any]]:
+        """
+        Read an openpyxl worksheet into a list-of-lists grid.
+
+        Merged cells are forward-filled: the top-left value of each
+        merged range is copied into every cell the range spans.
+        """
+        max_row = ws.max_row
+        max_col = ws.max_column
+        if not max_row or not max_col or max_row < 1:
+            return []
+
+        grid = []
+        for row in ws.iter_rows(
+            min_row=1, max_row=max_row, max_col=max_col, values_only=True
+        ):
+            grid.append(list(row))
+
+        for merged_range in ws.merged_cells.ranges:
+            min_r = merged_range.min_row - 1
+            max_r = merged_range.max_row - 1
+            min_c = merged_range.min_col - 1
+            max_c = merged_range.max_col - 1
+            value = grid[min_r][min_c] if min_r < len(grid) and min_c < len(grid[min_r]) else None
+            for r in range(min_r, min(max_r + 1, len(grid))):
+                for c in range(min_c, min(max_c + 1, len(grid[r]))):
+                    grid[r][c] = value
+
+        return grid
+
+    @staticmethod
+    def _xlsx_detect_header_row(grid: List[List[Any]]) -> Optional[int]:
+        """
+        Scan the first 15 rows to find the most likely header row.
+
+        A header row has the highest count of cells that look like column
+        names: non-null strings, length 2-80, not pure numbers or dates.
+        Requires at least 3 qualifying cells.
+        """
+        best_idx = None
+        best_score = 0
+        scan_limit = min(15, len(grid))
+
+        for row_idx in range(scan_limit):
+            row = grid[row_idx]
+            score = 0
+            qualifying_texts = []
+            for cell in row:
+                if cell is None:
+                    continue
+                text = str(cell).strip()
+                if not text or len(text) > 80:
+                    continue
+                if len(text) < 2 and not text.isalpha():
+                    continue
+                try:
+                    float(text.replace(",", ""))
+                    continue
+                except ValueError:
+                    pass
+                if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+                    continue
+                score += 1
+                qualifying_texts.append(text)
+
+            # Merged title rows have many cells but few unique values
+            unique_count = len(set(qualifying_texts))
+            if unique_count < 3:
+                score = min(score, unique_count)
+
+            if score >= 2 and score > best_score:
+                best_score = score
+                best_idx = row_idx
+
+        return best_idx
+
+    @staticmethod
+    def _xlsx_split_sections(
+        headers: List[str],
+        data_rows: List[List[Any]],
+    ) -> List[Tuple[Optional[str], List[List[Any]]]]:
+        """
+        Detect section separator rows and split data into named sections.
+
+        A separator row has values in only the first 1-2 columns while
+        the remaining columns are empty (e.g. "Corrugation - Related"
+        spanning column A with columns B-G all null). The separator text
+        becomes the section name; subsequent data rows belong to it.
+        """
+        if not data_rows or not headers:
+            return [(None, data_rows)]
+
+        num_cols = len(headers)
+        if num_cols < 3:
+            return [(None, data_rows)]
+
+        sections: List[Tuple[Optional[str], List[List[Any]]]] = []
+        current_name: Optional[str] = None
+        current_rows: List[List[Any]] = []
+
+        for row in data_rows:
+            non_empty = [
+                i for i, c in enumerate(row)
+                if c is not None and str(c).strip()
+            ]
+
+            is_separator = (
+                len(non_empty) <= 2
+                and len(non_empty) >= 1
+                and all(i < 2 for i in non_empty)
+                and num_cols >= 4
+            )
+
+            if is_separator:
+                sep_text = str(row[non_empty[0]]).strip()
+                # Bare numbers (row counters like "1", "2") are data, not separators
+                try:
+                    float(sep_text.replace(",", ""))
+                    current_rows.append(row)
+                    continue
+                except ValueError:
+                    pass
+                # Flush previous section (keep empty named sections for footer capture)
+                if current_rows or current_name is not None:
+                    sections.append((current_name, current_rows))
+                current_name = sep_text
+                current_rows = []
+            else:
+                current_rows.append(row)
+
+        if current_rows or current_name is not None:
+            sections.append((current_name, current_rows))
+
+        return sections if sections else [(None, data_rows)]
 
     def _load_xls_bytes(self, data: bytes, filename: str) -> List[Dict[str, Any]]:
         """
-        Pure-Python .xls extraction using xlrd (no LibreOffice needed).
-        Falls back to pandas openpyxl engine if xlrd is available.
+        Legacy .xls extraction.
+
+        Converts to in-memory .xlsx via pandas+xlrd, then delegates to
+        the smart _load_xlsx_bytes parser. Falls back to raw xlrd cell
+        extraction if conversion fails.
         """
+        try:
+            return self._load_xlsx_bytes(data, filename)
+        except Exception:
+            pass
+
         try:
             import xlrd
             wb = xlrd.open_workbook(file_contents=data)
             content = []
             for sheet_idx in range(wb.nsheets):
                 sheet = wb.sheet_by_index(sheet_idx)
+                if sheet.nrows < 2:
+                    continue
                 rows = []
                 for row_idx in range(sheet.nrows):
                     cells = []
@@ -2368,14 +2686,10 @@ class DocumentProcessor:
                     })
             return content
         except ImportError:
-            # xlrd not available — try pandas with various engines
-            try:
-                return self._load_xlsx_bytes(data, filename)
-            except Exception:
-                raise ValueError(
-                    f"Cannot read .xls file '{filename}'. "
-                    f"Install xlrd: pip install xlrd"
-                )
+            raise ValueError(
+                f"Cannot read .xls file '{filename}'. "
+                f"Install xlrd: pip install xlrd"
+            )
 
     # ===================================================================
     # Shared helpers
@@ -2505,6 +2819,27 @@ class DocumentProcessor:
                         else:
                             current_rows.append(row)
                             current_words += row_words
+
+                        # If a single row exceeds chunk_size * 3, split it
+                        # with a word-based sliding window (wide guidance tables
+                        # can have 4000+ words in one row).
+                        if (len(current_rows) == 1
+                                and len(current_rows[0].split()) > chunk_size * 3):
+                            oversized = current_rows[0]
+                            ow = oversized.split()
+                            current_rows = []
+                            for wi in range(0, len(ow), chunk_size - overlap):
+                                sub = " ".join(ow[wi: wi + chunk_size])
+                                if sub:
+                                    ct = '\n'.join(
+                                        header_lines + [separator] + [sub])
+                                    ch = doc_part.copy()
+                                    ch["text"] = ct
+                                    ch["chunk_id"] = len(chunks)
+                                    ch["chunk_role"] = "standalone"
+                                    ch["doc_type"] = "tabular"
+                                    chunks.append(ch)
+                            current_words = header_word_count
 
                     # Flush remaining rows
                     if current_rows:
@@ -2728,6 +3063,9 @@ class RAGSystem:
         self._index_type = "flat"  # Track whether we're using flat or IVF
         self.documents: List[Dict[str, Any]] = []
         self.bm25 = None
+        self._file_bm25 = None
+        self._file_names_ordered = []
+        self._file_chunk_groups = {}
 
         # Ingestion manifest for incremental processing
         manifest_path = os.path.join(self.faiss_local_path, "ingested_manifest.json")
@@ -2911,7 +3249,7 @@ class RAGSystem:
                     docs_processed += 1
                     self._ingestion_stats["total_docs"] += 1
                     logger.info(f"  [{docs_processed}/{len(blob_names)}] {blob_name} "
-                               f"→ {len(chunks)} chunks")
+                               f"-> {len(chunks)} chunks")
 
                 except Exception as e:
                     logger.error(f"  Error processing {blob_name}: {e}")
@@ -2976,7 +3314,7 @@ class RAGSystem:
                                 )
                                 docs_processed += 1
                                 self._ingestion_stats["total_docs"] += 1
-                                logger.info(f"  [{docs_processed}] {full_path} → {len(file_chunks)} chunks")
+                                logger.info(f"  [{docs_processed}] {full_path} -> {len(file_chunks)} chunks")
 
                                 # Checkpoint
                                 if docs_processed % self.checkpoint_every == 0:
@@ -3003,7 +3341,7 @@ class RAGSystem:
                     )
                     docs_processed += 1
                     self._ingestion_stats["total_docs"] += 1
-                    logger.info(f"  {file_path} → {len(file_chunks)} chunks")
+                    logger.info(f"  {file_path} -> {len(file_chunks)} chunks")
 
         if not all_chunks:
             logger.info("No new documents found to ingest.")
@@ -3209,6 +3547,8 @@ class RAGSystem:
             if self._index_type == "ivf" and hasattr(self.vector_store, 'nprobe'):
                 self.vector_store.nprobe = self.nprobe
 
+            self._build_file_level_index()
+
             logger.info(f"Index loaded ({self.vector_store.ntotal} vectors, "
                        f"{len(self.documents)} chunks, type={self._index_type})")
             return True
@@ -3240,6 +3580,31 @@ class RAGSystem:
         tokenized_corpus = [chunk["text"].lower().split() for chunk in self.documents]
         self.bm25 = BM25Okapi(tokenized_corpus)
         logger.info("BM25 index built.")
+        self._build_file_level_index()
+
+    def _build_file_level_index(self):
+        """Build a file-level BM25 index for cross-corpus source selection."""
+        self._file_chunk_groups = {}
+        for i, c in enumerate(self.documents):
+            sf = c.get("source_file", "")
+            if sf not in self._file_chunk_groups:
+                self._file_chunk_groups[sf] = []
+            self._file_chunk_groups[sf].append(i)
+
+        self._file_names_ordered = sorted(self._file_chunk_groups.keys())
+        file_docs = []
+        for sf in self._file_names_ordered:
+            chunk_ids = self._file_chunk_groups[sf]
+            combined = sf + " " + " ".join(
+                self.documents[i]["text"] for i in chunk_ids
+            )
+            file_docs.append(combined)
+
+        file_tokenized = [d.lower().split() for d in file_docs]
+        self._file_bm25 = BM25Okapi(file_tokenized)
+        logger.info(
+            f"File-level BM25 index built: {len(self._file_names_ordered)} files"
+        )
 
     # ------------------------------------------------------------------
     # Retrieval — Parent-Child Aware Hybrid
@@ -3252,12 +3617,12 @@ class RAGSystem:
         """Remove corporate document code prefixes from a filename stem.
 
         Examples:
-          'mg-css-gl-it-001_use of ai notetaker in meeting' → 'use of ai notetaker in meeting'
-          'fs_prp_08 cleaning' → 'cleaning'
-          'hr-sop-07 attendance top-up policy' → 'attendance top-up policy'
-          'wi-05 sitich glue' → 'sitich glue'
-          'laptop policy' → 'laptop policy' (no prefix to strip)
-          'sop-dispatch' → 'dispatch'
+          'mg-css-gl-it-001_use of ai notetaker in meeting' -> 'use of ai notetaker in meeting'
+          'fs_prp_08 cleaning' -> 'cleaning'
+          'hr-sop-07 attendance top-up policy' -> 'attendance top-up policy'
+          'wi-05 sitich glue' -> 'sitich glue'
+          'laptop policy' -> 'laptop policy' (no prefix to strip)
+          'sop-dispatch' -> 'dispatch'
         """
         lower = stem.lower()
         m = _CODE_PREFIX_RE.match(lower)
@@ -3284,8 +3649,8 @@ class RAGSystem:
         """Remove trailing codes and dates from a filename stem.
 
         Examples:
-          'risk assessment of suppliers_ fs.sp 4.00_ra-01 28.02.23' → 'risk assessment of suppliers'
-          'sop for intercompany tramsactions v1' → 'sop for intercompany tramsactions'
+          'risk assessment of suppliers_ fs.sp 4.00_ra-01 28.02.23' -> 'risk assessment of suppliers'
+          'sop for intercompany tramsactions v1' -> 'sop for intercompany tramsactions'
         """
         result = _CODE_SUFFIX_RE.sub("", stem)
         result = result.strip().rstrip('_').rstrip('-').rstrip()
@@ -3314,15 +3679,25 @@ class RAGSystem:
     def _words_overlap(w1: str, w2: str) -> bool:
         """Check if two words overlap (handles plurals, tense variations).
 
-        'supplier' and 'suppliers' → True
-        'assess' and 'assessment' → True
-        'laptop' and 'collaboration' → False
+        'supplier' and 'suppliers' -> True
+        'assess' and 'assessment' -> True
+        'calibrates' and 'calibration' -> True
+        'laptop' and 'collaboration' -> False
         """
         if w1 == w2:
             return True
         shorter, longer = (w1, w2) if len(w1) <= len(w2) else (w2, w1)
         if longer.startswith(shorter) and len(shorter) >= 4:
             return True
+        if len(shorter) >= 6:
+            prefix_len = 0
+            for c1, c2 in zip(w1, w2):
+                if c1 == c2:
+                    prefix_len += 1
+                else:
+                    break
+            if prefix_len >= 6:
+                return True
         return False
 
     @classmethod
@@ -3368,13 +3743,13 @@ class RAGSystem:
 
         Examples:
           Query: "what is the password policy?"
-            → matches "MG-CSS-GL-IT-003_PASSWORD POLICY.pdf" (SUBSTRING clean)
+            -> matches "MG-CSS-GL-IT-003_PASSWORD POLICY.pdf" (SUBSTRING clean)
           Query: "supplier risk assessment"
-            → matches all 3 RISK ASSESSMENT OF SUPPLIERS docs (KEYWORD)
+            -> matches all 3 RISK ASSESSMENT OF SUPPLIERS docs (KEYWORD)
           Query: "cleaning procedure"
-            → matches "FS_PRP_08 Cleaning.DOC" (SUBSTRING clean)
+            -> matches "FS_PRP_08 Cleaning.DOC" (SUBSTRING clean)
           Query: "policy"
-            → no match (too generic, hits GENERIC_GUARD)
+            -> no match (too generic, hits GENERIC_GUARD)
         """
         if DOC_MATCH_THRESHOLD >= 1.0:
             return []
@@ -3391,7 +3766,7 @@ class RAGSystem:
         matched_sources = []
 
         for src in source_files:
-            # Extract the stem: "Laptop Policy.docx" → "laptop policy"
+            # Extract the stem: "Laptop Policy.docx" -> "laptop policy"
             raw_stem = os.path.splitext(os.path.basename(src))[0].lower()
 
             # Strip code prefix and suffix to get the meaningful name
@@ -3464,66 +3839,134 @@ class RAGSystem:
                 clean_names.add(normalized)
 
             if len(clean_names) > 1:
-                # Multiple DIFFERENT documents matched → too generic, keep filter OFF
+                # Multiple DIFFERENT documents matched -> too generic, keep filter OFF
                 logger.info(
                     f"  Doc filter: GENERIC_GUARD triggered — "
-                    f"{len(matched_sources)} docs matched across {len(clean_names)} different names → filter OFF"
+                    f"{len(matched_sources)} docs matched across {len(clean_names)} different names -> filter OFF"
                 )
                 return []
 
         return matched_sources
 
-    def retrieve(self, query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
+    _STOP_WORDS = frozenset({
+        'the','of','for','and','a','in','on','is','to','what','how','does',
+        'are','by','from','with','do','this','that','an','at','it','its',
+        'our','we','be','was','were','been','which','who','whom','where',
+        'when','why','has','have','had',
+    })
+    _EXT_WORDS = frozenset({'xlsx','xls','xlsm','copy','doc','pdf','docx'})
+
+    @staticmethod
+    def _stem_word(w):
+        if len(w) > 3 and w.endswith('s'):
+            return w[:-1]
+        return w
+
+    @classmethod
+    def _word_set(cls, text):
+        return {cls._stem_word(w) for w in re.findall(r'\w+', text.lower())} - cls._STOP_WORDS
+
+    @staticmethod
+    def _get_source_group(fname):
+        name = fname
+        name = re.sub(r'^Copy of\s+', '', name, flags=re.IGNORECASE)
+        name = re.sub(r'\s*-\s*Copy\b', '', name, flags=re.IGNORECASE)
+        name = re.sub(r'\s*\(\d+\)', '', name)
+        name = re.sub(r'\.(xlsx?|xlsm|pdf|docx?)$', '', name, flags=re.IGNORECASE)
+        words = re.findall(r'[a-zA-Z]{2,}', name.lower())
+        skip = {'copy','latest','update','new','old','final','revised',
+                'version','philip','pc','of','for','the','and'}
+        sig = [w for w in words if w not in skip]
+        return ' '.join(sig[:4]) if sig else name.strip().lower()
+
+    _EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xls", ".csv"}
+
+    _DOMAIN_FILE_HINTS = [
+        # (trigger_terms, file_substrings)
+        # trigger_terms: if any term appears as substring in the lowercased query, this hint fires
+        # file_substrings: matched against lowercased basename of source files
+        (["calibrat", "instrument calibr"], ["calibration"]),
+        (["kpi"], ["kpi"]),
+        (["customer record", "customer code", "customer field", "customer template"], ["customer_template"]),
+        (["pre-production", "pre production", "enters production",
+          "job readiness", "before production"], ["pre-production", "pre production", "job readiness"]),
+        (["supplier list", "suppliers list", "all suppliers",
+          "ink supplier", "suppliers we purchase"], ["suppliers"]),
+        (["prp ", "prerequisite prog"], ["haccp manual"]),
+        (["utilities control", "utilities measure", "prp for utilities"], ["haccp manual"]),
+        (["client information", "fsms client"], ["f101", "fsms client"]),
+        (["food chain categor"], ["f101", "fsms client"]),
+        (["document master", "doc master"], ["document master"]),
+        (["retention period", "retention column"], ["document master"]),
+        (["product description", "shelf life", "raw material spec"], ["rm_product", "product description"]),
+    ]
+
+    def _domain_keyword_fallback(self, query: str, source_type: str = "all") -> List[str]:
+        """Fallback when _match_doc_names returns nothing: use domain-specific
+        keyword hints to identify likely source file(s)."""
+        query_lower = query.lower()
+        source_files = list(set(
+            d.get("source_file", "")
+            for d in self.documents if d.get("source_file")
+        ))
+
+        matched = set()
+        for triggers, file_patterns in self._DOMAIN_FILE_HINTS:
+            triggered = any(t in query_lower for t in triggers)
+            if not triggered:
+                continue
+
+            for sf in source_files:
+                if source_type == "excel":
+                    ext = os.path.splitext(sf)[1].lower()
+                    if ext not in self._EXCEL_EXTENSIONS:
+                        continue
+                basename_lower = os.path.basename(sf).lower()
+                if any(pat in basename_lower for pat in file_patterns):
+                    matched.add(sf)
+
+        return list(matched)
+
+    def retrieve(self, query: str, k: int = TOP_K, source_type: str = "all") -> List[Dict[str, Any]]:
         """
         Retrieve top-k relevant chunks for the query.
 
-        All chunks are standalone. Hybrid search → content-hash dedup → top k.
-
-        DOCUMENT FILTERING (v2 — improved matching):
-          If the query mentions or partially matches a document name,
-          only chunks from that document are sent to the LLM. This prevents
-          pulling in irrelevant chunks from other documents.
-
-          Matching now strips code prefixes (MG-CSS-GL-IT-003_, FS_PRP_08)
-          and suffixes (_FS.SP 4.00_RA-01 28.02.23), removes filler words,
-          and handles plurals/word stems — so partial and indirect references
-          also trigger the filter.
-
-          Examples:
-            "what is the password policy?"       → only PASSWORD POLICY chunks
-            "supplier risk assessment"            → only RISK ASSESSMENT OF SUPPLIERS chunks
-            "cleaning procedure"                  → only FS_PRP_08 Cleaning chunks
-            "stitch glue procedure"               → only WI-05 SITICH GLUE chunks
-            "what are the company policies?"      → no filter (too generic)
-
-        SIBLING PART EXPANSION:
-          When a chunk is Part N of M (large section was split), automatically
-          include ALL sibling parts so the LLM gets the full section.
+        Dispatches to source-type-specific retrieval:
+        - "all" (default): original retrieval logic for PDF/DOC content
+        - "excel": enhanced retrieval with domain hints, cross-corpus
+          scoring, rare-term injection, and chunk cap
         """
         if not self.vector_store or not self.bm25:
             return []
+        if source_type == "excel":
+            return self._retrieve_excel(query, k)
+        return self._retrieve_default(query, k)
+
+    # ------------------------------------------------------------------
+    # Default retrieval — original logic for PDF/DOC content
+    # ------------------------------------------------------------------
+    def _retrieve_default(self, query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
+        """Original retrieval path: doc filter -> hybrid search -> dedup ->
+        sibling/table expansion.  No domain hints, no cross-corpus scoring,
+        no chunk cap."""
 
         # ---- Step 1: Document name filtering ----
         matched_docs = self._match_doc_names(query)
         doc_filter_active = len(matched_docs) > 0
 
         if doc_filter_active:
-            logger.info(f"  Doc filter: query matches {matched_docs} → only sending chunks from these doc(s)")
+            logger.info(f"  Doc filter: query matches {matched_docs} -> only sending chunks from these doc(s)")
         else:
-            logger.info(f"  Doc filter: no specific document matched → searching all documents")
+            logger.info(f"  Doc filter: no specific document matched -> searching all documents")
 
         # ---- Step 2: Hybrid search ----
-        # Fetch more candidates when doc filter is active (we'll filter later)
-        # When doc filter is ON, fetch even more to ensure table chunks aren't cut off
         fetch_k = k * 5 if doc_filter_active else k * 3
         raw_results = self._retrieve_hybrid(query, fetch_k)
 
         seen_content_hashes: set = set()
         result: List[Dict[str, Any]] = []
 
-        # First pass: collect top-k unique chunks, filtered by doc if applicable
         for chunk in raw_results:
-            # Apply document filter if active
             if doc_filter_active:
                 if chunk.get("source_file", "") not in matched_docs:
                     continue
@@ -3536,8 +3979,24 @@ class RAGSystem:
             if len(result) >= k:
                 break
 
+        # If doc filter matched but no chunks survived, fall back to unfiltered
+        if not result and doc_filter_active:
+            logger.info(
+                f"  Doc filter fallback: no chunks from matched files — "
+                f"falling back to unfiltered retrieval"
+            )
+            doc_filter_active = False
+            seen_content_hashes.clear()
+            for chunk in raw_results:
+                h = _chunk_content_hash(chunk.get("text", ""))
+                if h in seen_content_hashes:
+                    continue
+                seen_content_hashes.add(h)
+                result.append(chunk)
+                if len(result) >= k:
+                    break
+
         # ---- Step 3: Sibling part expansion ----
-        # For split sections (Part N of M), pull in all sibling parts
         sibling_chunks = []
         for chunk in result:
             if chunk.get("section_total_parts", 1) <= 1:
@@ -3551,7 +4010,6 @@ class RAGSystem:
                         and doc.get("section_total_parts") == total):
                     h = _chunk_content_hash(doc.get("text", ""))
                     if h not in seen_content_hashes:
-                        # Still respect doc filter for siblings
                         if doc_filter_active and doc.get("source_file", "") not in matched_docs:
                             continue
                         seen_content_hashes.add(h)
@@ -3561,9 +4019,6 @@ class RAGSystem:
         result.extend(sibling_chunks)
 
         # ---- Step 3b: Table expansion ----
-        # When doc filter is ON and we have tabular chunks, pull in ALL tabular
-        # chunks from the same document so the LLM sees the complete table.
-        # This ensures assessment criteria tables with multiple rows are fully included.
         if doc_filter_active:
             tabular_sources_in_result = set()
             for chunk in result:
@@ -3593,6 +4048,16 @@ class RAGSystem:
             "raw_count": len(raw_results),
             "filtered_count": len(result),
             "sibling_count": len(sibling_chunks),
+            "chunks": [
+                {
+                    "chunk_id": c.get("chunk_id"),
+                    "source_file": c.get("source_file", ""),
+                    "section": c.get("heading_text", ""),
+                    "text": c.get("text", ""),
+                    "page": c.get("page_num", ""),
+                }
+                for c in result
+            ],
             "raw_results_preview": [
                 {
                     "chunk_id": c.get("chunk_id"),
@@ -3601,7 +4066,407 @@ class RAGSystem:
                     "text_len": len(c.get("text", "")),
                     "page": c.get("page_num", ""),
                 }
-                for c in raw_results[:30]  # first 30 raw results
+                for c in raw_results[:30]
+            ],
+        }
+
+        logger.info(
+            f"  Retrieval: {len(result)} chunks for LLM "
+            f"({len(result) - len(sibling_chunks)} from search + {len(sibling_chunks)} sibling parts)"
+            f"{' [DOC-FILTERED: ' + str(matched_docs) + ']' if doc_filter_active else ''}"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Excel retrieval — enhanced logic with all optimisations
+    # ------------------------------------------------------------------
+    def _retrieve_excel(self, query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
+        """Enhanced retrieval for Excel content: domain keyword fallback,
+        family expansion, adaptive TOP_K, cross-corpus scoring, rare-term
+        injection, BM25 direct scan, diversity cap, and chunk cap."""
+
+        # ---- Step 1: Document name filtering (Excel only) ----
+        all_matched = self._match_doc_names(query)
+        matched_docs = [
+            m for m in all_matched
+            if os.path.splitext(m)[1].lower() in self._EXCEL_EXTENSIONS
+        ]
+        doc_filter_active = len(matched_docs) > 0
+        logger.info(
+            f"  Source type filter: EXCEL only"
+            f"{' (doc filter: ' + str(matched_docs) + ')' if doc_filter_active else ''}"
+        )
+
+        # ---- Step 1a: Domain keyword fallback ----
+        if not doc_filter_active:
+            hint_matches = self._domain_keyword_fallback(query, "excel")
+            if hint_matches:
+                matched_docs = hint_matches
+                doc_filter_active = True
+                logger.info(
+                    f"  Domain keyword fallback: {hint_matches}"
+                )
+
+        # ---- Step 1b: Doc filter family expansion ----
+        if doc_filter_active:
+            all_sources = list(set(
+                d.get("source_file", "")
+                for d in self.documents if d.get("source_file")
+            ))
+            expanded = set(matched_docs)
+            for md in matched_docs:
+                md_stem = os.path.splitext(os.path.basename(md))[0].lower()
+                md_words = self._get_meaningful_words(
+                    self._get_meaningful_name(md_stem)
+                )
+                if len(md_words) < 2:
+                    continue
+                for sf in all_sources:
+                    if sf in expanded:
+                        continue
+                    ext = os.path.splitext(sf)[1].lower()
+                    if ext not in self._EXCEL_EXTENSIONS:
+                        continue
+                    sf_stem = os.path.splitext(os.path.basename(sf))[0].lower()
+                    sf_words = self._get_meaningful_words(
+                        self._get_meaningful_name(sf_stem)
+                    )
+                    overlap = md_words & sf_words
+                    if len(overlap) >= 2 and len(overlap) / len(md_words) >= 0.5:
+                        expanded.add(sf)
+            if len(expanded) > len(matched_docs):
+                logger.info(
+                    f"  Doc filter family expansion: {matched_docs} "
+                    f"-> {sorted(expanded)}"
+                )
+                matched_docs = list(expanded)
+
+        if doc_filter_active:
+            logger.info(f"  Doc filter: query matches {matched_docs} -> only sending chunks from these doc(s)")
+        else:
+            logger.info(f"  Doc filter: no specific document matched -> searching all Excel documents")
+
+        # ---- Step 1c: Adaptive TOP_K ----
+        if doc_filter_active:
+            effective_size = sum(
+                1 for d in self.documents
+                if d.get("source_file", "") in matched_docs
+            )
+        else:
+            effective_size = len(self.documents)
+
+        if effective_size <= 5:
+            k = max(k, 5)
+        elif effective_size <= 15:
+            k = max(k, 8)
+        elif effective_size <= 25:
+            k = max(k, 10)
+        elif effective_size <= 50:
+            k = max(k, 15)
+        elif effective_size <= 200:
+            k = max(k, 15)
+        elif effective_size <= 600:
+            k = max(k, 20)
+        else:
+            k = max(k, 30)
+
+        # ---- Step 1d: File-level source scoring (cross-corpus) ----
+        file_boost_map = {}
+        filename_matched = {}
+        _excel_soft_boost = False
+        _use_cross_corpus = (
+            not doc_filter_active
+            and self._file_bm25
+            and len(self._file_names_ordered) >= 5
+            and len(self.documents) >= 500
+        )
+        if _use_cross_corpus and self.bm25:
+            q_tokens = query.lower().split()
+            chunk_bm25 = self.bm25.get_scores(q_tokens)
+
+            excel_file_top: Dict[str, List[float]] = {}
+            for i, doc_chunk in enumerate(self.documents):
+                sf = doc_chunk.get("source_file", "")
+                ext = os.path.splitext(sf)[1].lower()
+                if ext not in self._EXCEL_EXTENSIONS:
+                    continue
+                if sf not in excel_file_top:
+                    excel_file_top[sf] = []
+                excel_file_top[sf].append(chunk_bm25[i])
+
+            file_agg = []
+            for sf, scores in excel_file_top.items():
+                top3 = sorted(scores, reverse=True)[:3]
+                file_agg.append((sf, sum(top3)))
+            file_agg.sort(key=lambda x: x[1], reverse=True)
+
+            if file_agg and file_agg[0][1] > 0:
+                max_agg = file_agg[0][1]
+                for sf, sc in file_agg:
+                    file_boost_map[sf] = 1.0 + 3.0 * (sc / max_agg)
+                _excel_soft_boost = True
+                logger.info(
+                    f"  Excel soft boost (chunk-agg): top files "
+                    f"{[(sf, round(sc, 1)) for sf, sc in file_agg[:5]]}"
+                )
+
+        # ---- Step 2: Hybrid search ----
+        fetch_k = k * 10
+        raw_results = self._retrieve_hybrid(query, fetch_k)
+
+        raw_results = [
+            c for c in raw_results
+            if os.path.splitext(c.get("source_file", ""))[1].lower()
+            in self._EXCEL_EXTENSIONS
+        ]
+        logger.info(f"  Excel filter: {len(raw_results)} chunks after filtering")
+
+        # ---- Step 2b: Rare-term chunk injection ----
+        if self.bm25 and not doc_filter_active:
+            _stop = self._STOP_WORDS | _FILLER_WORDS
+            q_words = {
+                w for w in re.findall(r'\w+', query.lower())
+                if len(w) >= 3 and w not in _stop
+            }
+            existing_ids = set(c.get("chunk_id") for c in raw_results)
+            rare_injected = 0
+            rare_threshold = max(int(len(self.documents) * 0.005), 5)
+
+            for word in q_words:
+                scores = self.bm25.get_scores([word])
+                matching_idx = np.where(scores > 0)[0]
+
+                if len(matching_idx) == 0 or len(matching_idx) > rare_threshold:
+                    continue
+
+                for ci in matching_idx:
+                    if ci in existing_ids:
+                        continue
+                    doc = self.documents[ci]
+                    ext = os.path.splitext(doc.get("source_file", ""))[1].lower()
+                    if ext not in self._EXCEL_EXTENSIONS:
+                        continue
+                    raw_results.insert(0, doc)
+                    existing_ids.add(ci)
+                    rare_injected += 1
+
+            if rare_injected:
+                matched_terms = q_words & set(re.findall(r'\w+', query.lower()))
+
+                logger.info(
+                    f"  Rare-term injection: added {rare_injected} chunks "
+                    f"for rare query terms {matched_terms}"
+                )
+
+                if _excel_soft_boost and file_boost_map:
+                    max_boost = max(file_boost_map.values())
+                    for chunk in raw_results[:rare_injected]:
+                        sf = chunk.get("source_file", "")
+                        if sf and file_boost_map.get(sf, 1.0) < max_boost:
+                            file_boost_map[sf] = max_boost
+                            logger.info(
+                                f"  Rare-term boost: {sf} -> {max_boost:.1f}"
+                            )
+
+        seen_content_hashes: set = set()
+        result: List[Dict[str, Any]] = []
+
+        if doc_filter_active:
+            for chunk in raw_results:
+                if chunk.get("source_file", "") not in matched_docs:
+                    continue
+                h = _chunk_content_hash(chunk.get("text", ""))
+                if h in seen_content_hashes:
+                    continue
+                seen_content_hashes.add(h)
+                result.append(chunk)
+                if len(result) >= k:
+                    break
+
+            if not result and self.bm25:
+                logger.info(
+                    f"  Doc filter matched {matched_docs} but no chunks in "
+                    f"top-{fetch_k} hybrid — scanning matched file directly"
+                )
+                q_tokens = query.lower().split()
+                bm25_scores = self.bm25.get_scores(q_tokens)
+                candidates = []
+                for i, doc_chunk in enumerate(self.documents):
+                    if doc_chunk.get("source_file", "") in matched_docs:
+                        candidates.append((bm25_scores[i], i, doc_chunk))
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                for _sc, _i, chunk in candidates:
+                    h = _chunk_content_hash(chunk.get("text", ""))
+                    if h in seen_content_hashes:
+                        continue
+                    seen_content_hashes.add(h)
+                    result.append(chunk)
+                    if len(result) >= k:
+                        break
+
+            if not result:
+                logger.info(
+                    f"  Doc filter fallback: no chunks from matched files — "
+                    f"falling back to unfiltered retrieval"
+                )
+                doc_filter_active = False
+                seen_content_hashes.clear()
+                for chunk in raw_results:
+                    h = _chunk_content_hash(chunk.get("text", ""))
+                    if h in seen_content_hashes:
+                        continue
+                    seen_content_hashes.add(h)
+                    result.append(chunk)
+                    if len(result) >= k:
+                        break
+        elif file_boost_map:
+            chunk_scores = []
+            for rank, chunk in enumerate(raw_results):
+                h = _chunk_content_hash(chunk.get("text", ""))
+                if h in seen_content_hashes:
+                    continue
+                seen_content_hashes.add(h)
+                sf = chunk.get("source_file", "")
+                boost = file_boost_map.get(sf, 1.0)
+                rrf_like = 1.0 / (60 + rank + 1)
+                chunk_scores.append((chunk, rrf_like * boost))
+
+            chunk_scores.sort(key=lambda x: x[1], reverse=True)
+
+            max_per_group = max(k // 10, 2)
+            group_counts = {}
+            result_files = set()
+            for chunk, score in chunk_scores:
+                sf = chunk.get("source_file", "")
+                group = self._get_source_group(sf)
+                gc = group_counts.get(group, 0)
+                if gc < max_per_group:
+                    result.append(chunk)
+                    result_files.add(sf)
+                    group_counts[group] = gc + 1
+                if len(result) >= k:
+                    break
+
+            # Guaranteed inclusion for top soft-boost files
+            if _excel_soft_boost:
+                top_boost = sorted(
+                    file_boost_map.items(), key=lambda x: x[1], reverse=True
+                )[:3]
+                for sf, boost_val in top_boost:
+                    if sf in result_files:
+                        continue
+                    if sf not in self._file_chunk_groups:
+                        continue
+                    bm25_scores = self.bm25.get_scores(query.lower().split())
+                    fchunks = self._file_chunk_groups[sf]
+                    scored = sorted(
+                        [(i, bm25_scores[i]) for i in fchunks],
+                        key=lambda x: x[1], reverse=True,
+                    )
+                    added = 0
+                    for ci, _ in scored:
+                        if added >= 2:
+                            break
+                        h = _chunk_content_hash(
+                            self.documents[ci].get("text", "")
+                        )
+                        if h not in seen_content_hashes:
+                            seen_content_hashes.add(h)
+                            result.insert(0, self.documents[ci])
+                            result_files.add(sf)
+                            added += 1
+                    if added:
+                        logger.info(
+                            f"  Soft-boost inclusion: added {added} chunks "
+                            f"from {sf} (boost={boost_val:.1f})"
+                        )
+        else:
+            for chunk in raw_results:
+                h = _chunk_content_hash(chunk.get("text", ""))
+                if h in seen_content_hashes:
+                    continue
+                seen_content_hashes.add(h)
+                result.append(chunk)
+                if len(result) >= k:
+                    break
+
+        # ---- Step 3: Sibling part expansion ----
+        sibling_chunks = []
+        for chunk in result:
+            if chunk.get("section_total_parts", 1) <= 1:
+                continue
+            heading = chunk.get("heading_text", "")
+            source  = chunk.get("source_file", "")
+            total   = chunk.get("section_total_parts", 1)
+            for doc in self.documents:
+                if (doc.get("heading_text") == heading
+                        and doc.get("source_file") == source
+                        and doc.get("section_total_parts") == total):
+                    h = _chunk_content_hash(doc.get("text", ""))
+                    if h not in seen_content_hashes:
+                        if doc_filter_active and doc.get("source_file", "") not in matched_docs:
+                            continue
+                        seen_content_hashes.add(h)
+                        sibling_chunks.append(doc)
+
+        sibling_chunks.sort(key=lambda c: c.get("section_part", 0))
+        result.extend(sibling_chunks)
+
+        # ---- Step 3b: Table expansion ----
+        if doc_filter_active:
+            tabular_sources_in_result = set()
+            for chunk in result:
+                if chunk.get("doc_type") == "tabular":
+                    tabular_sources_in_result.add(chunk.get("source_file", ""))
+
+            if tabular_sources_in_result:
+                table_expansion_chunks = []
+                for doc in self.documents:
+                    if doc.get("doc_type") != "tabular":
+                        continue
+                    if doc.get("source_file", "") not in tabular_sources_in_result:
+                        continue
+                    h = _chunk_content_hash(doc.get("text", ""))
+                    if h not in seen_content_hashes:
+                        seen_content_hashes.add(h)
+                        table_expansion_chunks.append(doc)
+                result.extend(table_expansion_chunks)
+                if table_expansion_chunks:
+                    logger.info(f"  Table expansion: added {len(table_expansion_chunks)} additional table chunks")
+
+        # ---- Step 3c: Hard cap on chunks sent to LLM ----
+        MAX_CHUNKS_TO_LLM = 8
+        if len(result) > MAX_CHUNKS_TO_LLM:
+            logger.info(f"  Chunk cap: trimming {len(result)} -> {MAX_CHUNKS_TO_LLM}")
+            result = result[:MAX_CHUNKS_TO_LLM]
+
+        # ---- Step 4: Store retrieval debug info ----
+        self._last_retrieval_debug = {
+            "query": query,
+            "doc_filter_active": doc_filter_active,
+            "matched_docs": matched_docs,
+            "raw_count": len(raw_results),
+            "filtered_count": len(result),
+            "sibling_count": len(sibling_chunks),
+            "chunks": [
+                {
+                    "chunk_id": c.get("chunk_id"),
+                    "source_file": c.get("source_file", ""),
+                    "section": c.get("heading_text", ""),
+                    "text": c.get("text", ""),
+                    "page": c.get("page_num", ""),
+                }
+                for c in result
+            ],
+            "raw_results_preview": [
+                {
+                    "chunk_id": c.get("chunk_id"),
+                    "source": c.get("source_file", "?"),
+                    "heading": c.get("heading_text", ""),
+                    "text_len": len(c.get("text", "")),
+                    "page": c.get("page_num", ""),
+                }
+                for c in raw_results[:30]
             ],
         }
 
@@ -3693,6 +4558,7 @@ class RAGSystem:
                     "11. When listing items from a table, you MUST first COUNT every row"
                     "in the source, state the total count found, then list every single"
                     "one. Never stop listing until you have listed ALL rows you counted."
+
                 ),
             },
             {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
@@ -3705,6 +4571,7 @@ class RAGSystem:
             "options": {
                 "temperature": 0,
                 "num_predict": OLLAMA_NUM_PREDICT,
+                "num_ctx": 16384,
             },
         }
 
@@ -3749,8 +4616,8 @@ class RAGSystem:
 
         Uses the LLM to expand short/vague queries into more specific
         retrieval-friendly queries. For example:
-          "section 3" → "section 3 complete details all subsections 3.1 3.2 3.3"
-          "what is the policy" → "policy definition scope applicability requirements"
+          "section 3" -> "section 3 complete details all subsections 3.1 3.2 3.3"
+          "what is the policy" -> "policy definition scope applicability requirements"
 
         If the query is already specific (>20 chars with detail words),
         it passes through unchanged.
@@ -3802,7 +4669,7 @@ class RAGSystem:
             reformulated = result.get("message", {}).get("content", "").strip()
 
             if reformulated and len(reformulated) > len(query):
-                logger.info(f"  Query reformulated: '{query}' → '{reformulated}'")
+                logger.info(f"  Query reformulated: '{query}' -> '{reformulated}'")
                 return reformulated
             else:
                 logger.info("  Reformulation not better — using original query")
@@ -3862,11 +4729,11 @@ class RAGSystem:
                         raw_stem = os.path.splitext(os.path.basename(md))[0].lower()
                         clean_name = self._get_meaningful_name(raw_stem)
                         if clean_name != raw_stem:
-                            lines.append(f"    → Matched: {md}  (clean name: '{clean_name}')")
+                            lines.append(f"    -> Matched: {md}  (clean name: '{clean_name}')")
                         else:
-                            lines.append(f"    → Matched: {md}")
+                            lines.append(f"    -> Matched: {md}")
                 elif debug_info.get('generic_guard_triggered'):
-                    lines.append(f"    → GENERIC_GUARD: query too generic, matched {debug_info['generic_guard_count']} different docs")
+                    lines.append(f"    -> GENERIC_GUARD: query too generic, matched {debug_info['generic_guard_count']} different docs")
                 lines.append(f"  Raw search hits:   {debug_info['raw_count']}")
                 lines.append(f"  After filter:      {debug_info['filtered_count']}")
                 lines.append(f"  Sibling parts:     {debug_info['sibling_count']}")
@@ -3991,15 +4858,11 @@ class RAGSystem:
     # ------------------------------------------------------------------
     # Chat entry point
     # ------------------------------------------------------------------
-    def chat(self, query: str) -> str:
-        # Use the original query directly for retrieval.
-        # Reformulation was expanding short queries into long verbose strings
-        # which pulled in chunks from unrelated documents (e.g. asking about
-        # AI Notetaker was pulling in Password Policy chunks).
+    def chat(self, query: str, source_type: str = "all") -> str:
         search_query = query
 
         # Step 2: Retrieve using the original query
-        chunks = self.retrieve(search_query)
+        chunks = self.retrieve(search_query, source_type=source_type)
         if not chunks:
             return "No relevant documents found. Please ingest documents first."
 
@@ -4018,6 +4881,9 @@ class RAGSystem:
         self._index_type = "flat"
         self.documents = []
         self.bm25 = None
+        self._file_bm25 = None
+        self._file_names_ordered = []
+        self._file_chunk_groups = {}
         self._chunk_hashes: set = set()
         self._last_retrieval_debug = None
         self._ingestion_stats = {
