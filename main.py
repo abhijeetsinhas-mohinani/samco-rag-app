@@ -18,16 +18,16 @@ import logging
 from typing import List, Optional
 
 import dotenv
+
+# Load .env BEFORE importing rag_pipeline so its module-level
+# os.getenv() calls pick up the configured values.
+dotenv.load_dotenv()
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query as QueryParam
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from rag_pipeline import RAGSystem, DocumentProcessor
-
-# ---------------------------------------------------------------------------
-# Load environment
-# ---------------------------------------------------------------------------
-dotenv.load_dotenv()
 
 logger = logging.getLogger("rag_fastapi")
 
@@ -69,6 +69,7 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/z/my-project/upload")
 # ---------------------------------------------------------------------------
 class QueryRequest(BaseModel):
     question: str
+    source_type: str = "all"
 
 class QueryResponse(BaseModel):
     answer: str
@@ -192,7 +193,7 @@ async def query_rag(request: QueryRequest):
         raise HTTPException(status_code=400, detail="No documents ingested. Upload or ingest first.")
 
     try:
-        answer = rag.chat(request.question)
+        answer = rag.chat(request.question, source_type=request.source_type)
 
         # Get debug info from last retrieval
         debug = getattr(rag, '_last_retrieval_debug', {})
@@ -210,7 +211,10 @@ async def query_rag(request: QueryRequest):
 
 
 @app.post("/query/simple", tags=["Query"])
-async def query_simple(question: str = QueryParam(..., description="Your question")):
+async def query_simple(
+    question: str = QueryParam(..., description="Your question"),
+    source_type: str = QueryParam("all", description="Filter: 'all' or 'excel'"),
+):
     """Simple query endpoint — just pass the question as a query parameter."""
     if rag is None:
         raise HTTPException(status_code=503, detail="RAG system not initialized yet")
@@ -219,7 +223,7 @@ async def query_simple(question: str = QueryParam(..., description="Your questio
         raise HTTPException(status_code=400, detail="No documents ingested.")
 
     try:
-        answer = rag.chat(question)
+        answer = rag.chat(question, source_type=source_type)
         return {"answer": answer}
     except Exception as e:
         logger.error(f"Query failed: {e}")
