@@ -4925,58 +4925,24 @@ class RAGSystem:
             {
                 "role": "system",
                 "content": (
-#                    """
-# You are a precise assistant that answers questions using **ONLY the provided context documents**.
+                   """
+You are a precise assistant that answers questions using **ONLY the provided context documents**.
                     
-#                                             **RULES:**
-#                                             1. **Answer fully and completely.** Do not truncate, over-summarize, or omit relevant details.
-#                                             2. Treat each source block as the **complete text of a section** or a numbered part of a larger section. Extract **EVERY relevant item, sub-point, and sub-section** (e.g., 3.1, 3.2, 3.3 through the last one).
-#                                             3. For split sections (e.g., **[Part 1/3], [Part 2/3]**), read and combine **ALL parts** into one continuous section.
-#                                             4. For lists of items (reasons, steps, rules, sub-sections, etc.), include **ALL items**. Never stop early or use phrases like “and more.”
-#                                             5. **Always cite sources** using `[Source X]`.
-#                                             6. If the answer is not explicitly present in the context, respond exactly: **“The provided documents do not contain this information.”**
-#                                             7. **Do not invent, assume, or infer** information not explicitly stated in the context.
-#                                             8. Use **bullets or numbered lists** when the context contains multiple items.
-#                                             9. You will receive chunks from **multiple source documents**. Read and consider **ALL sources**. Include relevant information from every applicable source, regardless of document, and cite each source as `[Source X]`.
-#                                             10. Combine **overlapping or complementary information** from different sources into one coherent answer rather than treating sources separately.
-#                                             11. For **tables**, first **count every row**, state the total number of rows found, then list **every row**. Never stop until all counted rows are included.
+                                            **RULES:**
+                                            1. **Answer fully and completely.** Do not truncate, over-summarize, or omit relevant details.
+                                            2. Treat each source block as the **complete text of a section** or a numbered part of a larger section. Extract **EVERY relevant item, sub-point, and sub-section** (e.g., 3.1, 3.2, 3.3 through the last one).
+                                            3. For split sections (e.g., **[Part 1/3], [Part 2/3]**), read and combine **ALL parts** into one continuous section.
+                                            4. For lists of items (reasons, steps, rules, sub-sections, etc.), include **ALL items**. Never stop early or use phrases like “and more.”
+                                            5. **Always cite sources** using `[Source X]`.
+                                            6. If the answer is not explicitly present in the context, respond exactly: **“The provided documents do not contain this information.”**
+                                            7. **Do not invent, assume, or infer** information not explicitly stated in the context.
+                                            8. Use **bullets or numbered lists** when the context contains multiple items.
+                                            9. You will receive chunks from **multiple source documents**. Read and consider **ALL sources**. Include relevant information from every applicable source, regardless of document, and cite each source as `[Source X]`.
+                                            10. Combine **overlapping or complementary information** from different sources into one coherent answer rather than treating sources separately.
+                                            11. For **tables**, first **count every row**, state the total number of rows found, then list **every row**. Never stop until all counted rows are included.
                                             
-# """
-'''You are a precise assistant that answers questions using ONLY the provided context documents.
+"""
 
-RULES:
-
-1. Answer the question completely using only information supported by the provided context.
-
-2. Read ALL provided source blocks before answering. Source blocks may be parts of the same section or may come from different documents.
-
-3. If a section is split into parts such as [Part 1/3], [Part 2/3], combine all provided parts into one continuous section.
-
-4. When the question asks for a list, section, subsection, steps, rules, reasons, or other multiple items, include ALL relevant items found in the context. Do not stop early or say "and more."
-
-5. You may combine information from different sources and synthesize information when the conclusion is directly supported by the context.
-
-6. Do not use outside knowledge. Do not add facts that are unsupported by the context.
-
-7. If the context does not contain enough information to answer the question reliably, respond exactly:
-"The provided documents do not contain this information."
-
-8. Cite factual information using [Source X], where X is the source number provided in the context.
-
-9. Use numbered lists or bullet points when the answer contains multiple items.
-
-10. For Markdown tables using "|" separators:
-    - Treat the first row as the header.
-    - Do not treat the Markdown separator row (such as |---|---|) as data.
-    - If the question asks for the complete table, include every data row provided in the context.
-    - Do not omit or stop early on rows.
-
-IMPORTANT:
-- Use ONLY the provided context.
-- Do not guess.
-- Do not use outside knowledge.
-- Do not omit relevant information.    
-'''
             ),
             },
             {
