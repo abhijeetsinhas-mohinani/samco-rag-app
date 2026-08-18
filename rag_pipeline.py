@@ -10,7 +10,7 @@ import hashlib
 import requests
 import traceback
 from difflib import SequenceMatcher
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple , Set
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -3927,20 +3927,235 @@ class RAGSystem:
 
         return list(matched)
 
-    def retrieve(self, query: str, k: int = TOP_K, source_type: str = "all") -> List[Dict[str, Any]]:
-        """
-        Retrieve top-k relevant chunks for the query.
+    # def retrieve(self, query: str, k: int = TOP_K, source_type: str = "all") -> List[Dict[str, Any]]:
+    #     """
+    #     Retrieve top-k relevant chunks for the query.
 
-        Dispatches to source-type-specific retrieval:
-        - "all" (default): original retrieval logic for PDF/DOC content
-        - "excel": enhanced retrieval with domain hints, cross-corpus
-          scoring, rare-term injection, and chunk cap
-        """
-        if not self.vector_store or not self.bm25:
-            return []
-        if source_type == "excel":
-            return self._retrieve_excel(query, k)
-        return self._retrieve_default(query, k)
+    #     Dispatches to source-type-specific retrieval:
+    #     - "all" (default): original retrieval logic for PDF/DOC content
+    #     - "excel": enhanced retrieval with domain hints, cross-corpus
+    #       scoring, rare-term injection, and chunk cap
+    #     """
+    #     if not self.vector_store or not self.bm25:
+    #         return []
+    #     if source_type == "excel":
+    #         return self._retrieve_excel(query, k)
+    #     return self._retrieve_default(query, k)
+
+    def _embed(self, query: str) -> np.ndarray:
+    
+        embedding = self.embedder.encode(
+                query,
+                normalize_embeddings=True,
+            )
+    
+        return np.asarray(
+                [embedding],
+                dtype=np.float32,
+            )
+    
+        # =============================================================
+        # Tokenization
+        # =============================================================
+    
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+    
+        return re.findall(
+                r"\b\w+\b",
+                text.lower(),
+            )
+    
+        # =============================================================
+        # Word count
+        # =============================================================
+    
+    @staticmethod
+    def _word_count(text: str) -> int:
+    
+        return len(
+                re.findall(
+                    r"\b\w+\b",
+                    text,
+                )
+            )
+    
+        # =============================================================
+        # FAISS
+        # =============================================================
+    
+    def _vector_search(self, query: str):
+
+        query_vector = self._embed(query)
+
+        # No source filtering, so only retrieve top 50
+        search_k = min(50, self.vector_store.ntotal)
+
+        distances, indices = self.vector_store.search(
+            query_vector,
+            search_k,
+        )
+
+        results = []
+
+        for rank, (position, idx) in enumerate(
+            zip(range(len(indices[0])), indices[0]),
+            start=1,
+        ):
+            if idx == -1:
+                continue
+
+            idx = int(idx)
+
+            document = self.documents[idx]
+
+            results.append({
+                "id": idx,
+                "rank": rank,
+                "score": float(distances[0][position]),
+                "document": document,
+            })
+
+        return results
+
+
+# =============================================================
+# BM25
+# =============================================================
+
+    def _bm25_search(self, query: str):
+
+        query_tokens = self._tokenize(query)
+
+        scores = self.bm25.get_scores(query_tokens)
+
+        candidate_count = min(
+            30,
+            len(scores),
+        )
+
+        indices = np.argsort(scores)[::-1][:candidate_count]
+
+        results = []
+
+        for rank, idx in enumerate(indices, start=1):
+
+            idx = int(idx)
+
+            document = self.documents[idx]
+
+            results.append({
+                "id": idx,
+                "rank": rank,
+                "score": float(scores[idx]),
+                "document": document,
+            })
+
+        return results
+            # =============================================================
+        # RRF
+        # =============================================================
+    
+    def _rrf(
+            self,
+            vector_results,
+            bm25_results,
+        ):
+    
+        scores: Dict[int, float] = {}
+
+        for result in vector_results:
+
+            idx = result["id"]
+
+            scores[idx] = (
+                scores.get(idx, 0.0)
+                + 1.0 / (60 + result["rank"])
+            )
+
+        for result in bm25_results:
+
+            idx = result["id"]
+
+            scores[idx] = (
+                scores.get(idx, 0.0)
+                + 1.0 / (60 + result["rank"])
+            )
+
+        ranked = sorted(
+            scores.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        return ranked
+    
+
+    def retrieve(
+            self,
+            query: str,
+            top_k: int = 8,
+            source_type: str = None,
+        ):
+    
+    
+            # FAISS top 50
+            vector_results = self._vector_search(
+                query,
+            )
+    
+            # BM25 top 30
+            bm25_results = self._bm25_search(
+                query,
+            )
+            # Save Vector and BM25 results before RRF
+            with open("pre_rrf_results.txt", "w", encoding="utf-8") as f:
+                f.write("========== VECTOR SEARCH RESULTS ==========\n\n")
+    
+                for rank, result in enumerate(vector_results, 1):
+                    f.write(f"--- Vector Result {rank} ---\n")
+                    f.write(f"{result}\n\n")
+    
+                f.write("\n========== BM25 SEARCH RESULTS ==========\n\n")
+    
+                for rank, result in enumerate(bm25_results, 1):
+                    f.write(f"--- BM25 Result {rank} ---\n")
+                    f.write(f"{result}\n\n")
+    
+            # RRF
+            ranked = self._rrf(
+                vector_results,
+                bm25_results,
+            )
+    
+            # ---------------------------------------------------------
+            # Remove chunks with < 8 words AFTER RRF
+            # ---------------------------------------------------------
+    
+            retrieved = []
+    
+            for idx, rrf_score in ranked:
+    
+                document = self.documents[idx]
+    
+                text = document.get(
+                    "text",
+                    "",
+                )
+    
+                if self._word_count(text) < 8:
+                    continue
+    
+                retrieved.append({
+                    "rank": len(retrieved) + 1,
+                    "rrf_score": rrf_score,
+                    "document": document,
+                })
+    
+                if len(retrieved) >= top_k:
+                    break
+    
+            return retrieved
 
     # ------------------------------------------------------------------
     # Default retrieval — original logic for PDF/DOC content
@@ -4504,64 +4719,274 @@ class RAGSystem:
     # ------------------------------------------------------------------
     # Generation — Ollama Native API with retry logic
     # ------------------------------------------------------------------
-    def generate_answer(self, query: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
-        """Generate answer using Ollama's native /api/chat endpoint with retry logic."""
+    # def generate_answer(self, query: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
+    #     """Generate answer using Ollama's native /api/chat endpoint with retry logic."""
+    #     context = ""
+    #     for i, chunk in enumerate(retrieved_chunks):
+    #         source = chunk.get("source_file", "Unknown")
+    #         page = f", Page: {chunk.get('page_num')}" if chunk.get("page_num") else ""
+    #         sheet = f", Sheet: {chunk.get('sheet_name')}" if chunk.get("sheet_name") else ""
+
+    #         heading = chunk.get("heading_text", "")
+    #         parent_path = chunk.get("parent_path", "")
+    #         hierarchy = ""
+    #         if heading:
+    #             hierarchy = f", Section: {parent_path + ' > ' if parent_path else ''}{heading}"
+
+    #         # Show part info when a large section was split
+    #         part_info = ""
+    #         if chunk.get("section_total_parts", 1) > 1:
+    #             part_info = f" [Part {chunk['section_part']}/{chunk['section_total_parts']}]"
+
+    #         context += f"--- Source {i + 1}: {source}{page}{sheet}{hierarchy}{part_info} ---\n{chunk['text']}\n\n"
+
+    #     messages = [
+    #         {
+    #             "role": "system",
+    #             "content": (
+    #                 "You are a precise assistant that answers questions using ONLY the "
+    #                 "provided context documents.\n\n"
+    #                 "RULES:\n"
+    #                 "1. Answer FULLY and COMPLETELY — do not cut off, summarize too briefly, "
+    #                 "or skip any relevant detail from the context.\n"
+    #                 "2. Each source block contains the COMPLETE text of a section (or a numbered "
+    #                 "part of a large section). Extract EVERY relevant item, sub-point, or "
+    #                 "sub-section it mentions — including 3.1, 3.2, 3.3 ... through the last one.\n"
+    #                 "3. When multiple source blocks are parts of the same section "
+    #                 "(e.g. [Part 1/3], [Part 2/3]), read ALL parts together as one continuous section "
+    #                 "and give a single combined answer.\n"
+    #                 "4. When the context lists items (e.g. reasons, steps, rules, sub-sections), "
+    #                 "include ALL of them — never stop early or say 'and more'.\n"
+    #                 "5. Always cite sources using [Source X] format.\n"
+    #                 "6. If the answer is NOT in the context, say exactly: "
+    #                 "'The provided documents do not contain this information.'\n"
+    #                 "7. Do NOT invent or infer anything not explicitly stated in the context.\n"
+    #                 "8. Use bullet points or numbered lists when the context has multiple items.\n"
+    #                 "9. You will receive chunks from MULTIPLE source documents. You MUST read "
+    #                 "and consider ALL of them — do NOT ignore or skip any source. "
+    #                 "Synthesize information across all relevant sources and cite each one "
+    #                 "using [Source X]. If a source contains relevant information to the question, "
+    #                 "include it in your answer regardless of which document it comes from.\n"
+    #                 "10. When sources from different documents provide overlapping or complementary "
+    #                 "information, combine them into a single coherent answer rather than treating "
+    #                 "each source in isolation.\n"
+    #                 "11. When listing items from a table, you MUST first COUNT every row"
+    #                 "in the source, state the total count found, then list every single"
+    #                 "one. Never stop listing until you have listed ALL rows you counted."
+
+    #             ),
+    #         },
+    #         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
+    #     ]
+
+    #     payload = {
+    #         "model": self.model_name,
+    #         "messages": messages,
+    #         "stream": False,
+    #         "options": {
+    #             "temperature": 0,
+    #             "num_predict": OLLAMA_NUM_PREDICT,
+    #             "num_ctx": 16384,
+    #         },
+    #     }
+
+    #     url = f"{self.ollama_base_url}/api/chat"
+
+    #     # Retry logic for Ollama
+    #     for attempt in range(1, OLLAMA_MAX_RETRIES + 1):
+    #         try:
+    #             response = requests.post(
+    #                 url, json=payload, timeout=120, verify=self.ssl_verify
+    #             )
+    #             response.raise_for_status()
+    #             result = response.json()
+    #             return result.get("message", {}).get("content", "No response from Ollama.")
+    #         except requests.exceptions.ConnectionError:
+    #             if attempt == OLLAMA_MAX_RETRIES:
+    #                 return (
+    #                     f"Error: Could not connect to Ollama at {self.ollama_base_url}. "
+    #                     f"Make sure Ollama is running: 'ollama serve'"
+    #                 )
+    #             logger.warning(f"Ollama connection retry {attempt}/{OLLAMA_MAX_RETRIES}...")
+    #             time.sleep(OLLAMA_RETRY_DELAY * attempt)
+    #         except requests.exceptions.Timeout:
+    #             if attempt == OLLAMA_MAX_RETRIES:
+    #                 return "Error: Ollama request timed out. Try a smaller model or simpler query."
+    #             logger.warning(f"Ollama timeout retry {attempt}/{OLLAMA_MAX_RETRIES}...")
+    #             time.sleep(OLLAMA_RETRY_DELAY * attempt)
+    #         except Exception as e:
+    #             if attempt == OLLAMA_MAX_RETRIES:
+    #                 return f"Error generating answer: {e}"
+    #             logger.warning(f"Ollama error retry {attempt}/{OLLAMA_MAX_RETRIES}: {e}")
+    #             time.sleep(OLLAMA_RETRY_DELAY * attempt)
+
+    #     return "Error: All Ollama retries exhausted."
+
+
+
+    def _build_context(
+            self,
+            retrieved_chunks,
+        ):
+    
         context = ""
-        for i, chunk in enumerate(retrieved_chunks):
-            source = chunk.get("source_file", "Unknown")
-            page = f", Page: {chunk.get('page_num')}" if chunk.get("page_num") else ""
-            sheet = f", Sheet: {chunk.get('sheet_name')}" if chunk.get("sheet_name") else ""
 
-            heading = chunk.get("heading_text", "")
-            parent_path = chunk.get("parent_path", "")
+        for i, result in enumerate(
+            retrieved_chunks
+        ):
+
+            chunk = result["document"]
+
+            source = chunk.get(
+                "source_file",
+                "Unknown",
+            )
+
+            page = ""
+
+            if chunk.get("page_num"):
+                page = (
+                    f", Page: "
+                    f"{chunk['page_num']}"
+                )
+
+            sheet = ""
+
+            if chunk.get("sheet_name"):
+                sheet = (
+                    f", Sheet: "
+                    f"{chunk['sheet_name']}"
+                )
+
+            heading = chunk.get(
+                "heading_text",
+                "",
+            )
+
+            parent_path = chunk.get(
+                "parent_path",
+                "",
+            )
+
             hierarchy = ""
+
             if heading:
-                hierarchy = f", Section: {parent_path + ' > ' if parent_path else ''}{heading}"
 
-            # Show part info when a large section was split
+                hierarchy = (
+                    ", Section: "
+                    + (
+                        parent_path + " > "
+                        if parent_path
+                        else ""
+                    )
+                    + heading
+                )
+
             part_info = ""
-            if chunk.get("section_total_parts", 1) > 1:
-                part_info = f" [Part {chunk['section_part']}/{chunk['section_total_parts']}]"
 
-            context += f"--- Source {i + 1}: {source}{page}{sheet}{hierarchy}{part_info} ---\n{chunk['text']}\n\n"
+            if chunk.get(
+                "section_total_parts",
+                1,
+            ) > 1:
+
+                part_info = (
+                    f" [Part "
+                    f"{chunk['section_part']}/"
+                    f"{chunk['section_total_parts']}]"
+                )
+
+            context += (
+                f"--- Source {i + 1}: "
+                f"{source}"
+                f"{page}"
+                f"{sheet}"
+                f"{hierarchy}"
+                f"{part_info} ---\n"
+                f"{chunk.get('text', '')}\n\n"
+            )
+
+        return context
+    
+        # =============================================================
+        # Generate Answer
+        # =============================================================
+    
+    def generate_answer(
+            self,
+            query: str,
+            retrieved_chunks,
+        ):
+    
+        context = self._build_context(
+            retrieved_chunks
+        )
 
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a precise assistant that answers questions using ONLY the "
-                    "provided context documents.\n\n"
-                    "RULES:\n"
-                    "1. Answer FULLY and COMPLETELY — do not cut off, summarize too briefly, "
-                    "or skip any relevant detail from the context.\n"
-                    "2. Each source block contains the COMPLETE text of a section (or a numbered "
-                    "part of a large section). Extract EVERY relevant item, sub-point, or "
-                    "sub-section it mentions — including 3.1, 3.2, 3.3 ... through the last one.\n"
-                    "3. When multiple source blocks are parts of the same section "
-                    "(e.g. [Part 1/3], [Part 2/3]), read ALL parts together as one continuous section "
-                    "and give a single combined answer.\n"
-                    "4. When the context lists items (e.g. reasons, steps, rules, sub-sections), "
-                    "include ALL of them — never stop early or say 'and more'.\n"
-                    "5. Always cite sources using [Source X] format.\n"
-                    "6. If the answer is NOT in the context, say exactly: "
-                    "'The provided documents do not contain this information.'\n"
-                    "7. Do NOT invent or infer anything not explicitly stated in the context.\n"
-                    "8. Use bullet points or numbered lists when the context has multiple items.\n"
-                    "9. You will receive chunks from MULTIPLE source documents. You MUST read "
-                    "and consider ALL of them — do NOT ignore or skip any source. "
-                    "Synthesize information across all relevant sources and cite each one "
-                    "using [Source X]. If a source contains relevant information to the question, "
-                    "include it in your answer regardless of which document it comes from.\n"
-                    "10. When sources from different documents provide overlapping or complementary "
-                    "information, combine them into a single coherent answer rather than treating "
-                    "each source in isolation.\n"
-                    "11. When listing items from a table, you MUST first COUNT every row"
-                    "in the source, state the total count found, then list every single"
-                    "one. Never stop listing until you have listed ALL rows you counted."
+#                    """
+# You are a precise assistant that answers questions using **ONLY the provided context documents**.
+                    
+#                                             **RULES:**
+#                                             1. **Answer fully and completely.** Do not truncate, over-summarize, or omit relevant details.
+#                                             2. Treat each source block as the **complete text of a section** or a numbered part of a larger section. Extract **EVERY relevant item, sub-point, and sub-section** (e.g., 3.1, 3.2, 3.3 through the last one).
+#                                             3. For split sections (e.g., **[Part 1/3], [Part 2/3]**), read and combine **ALL parts** into one continuous section.
+#                                             4. For lists of items (reasons, steps, rules, sub-sections, etc.), include **ALL items**. Never stop early or use phrases like “and more.”
+#                                             5. **Always cite sources** using `[Source X]`.
+#                                             6. If the answer is not explicitly present in the context, respond exactly: **“The provided documents do not contain this information.”**
+#                                             7. **Do not invent, assume, or infer** information not explicitly stated in the context.
+#                                             8. Use **bullets or numbered lists** when the context contains multiple items.
+#                                             9. You will receive chunks from **multiple source documents**. Read and consider **ALL sources**. Include relevant information from every applicable source, regardless of document, and cite each source as `[Source X]`.
+#                                             10. Combine **overlapping or complementary information** from different sources into one coherent answer rather than treating sources separately.
+#                                             11. For **tables**, first **count every row**, state the total number of rows found, then list **every row**. Never stop until all counted rows are included.
+                                            
+# """
+'''You are a precise assistant that answers questions using ONLY the provided context documents.
 
+RULES:
+
+1. Answer the question completely using only information supported by the provided context.
+
+2. Read ALL provided source blocks before answering. Source blocks may be parts of the same section or may come from different documents.
+
+3. If a section is split into parts such as [Part 1/3], [Part 2/3], combine all provided parts into one continuous section.
+
+4. When the question asks for a list, section, subsection, steps, rules, reasons, or other multiple items, include ALL relevant items found in the context. Do not stop early or say "and more."
+
+5. You may combine information from different sources and synthesize information when the conclusion is directly supported by the context.
+
+6. Do not use outside knowledge. Do not add facts that are unsupported by the context.
+
+7. If the context does not contain enough information to answer the question reliably, respond exactly:
+"The provided documents do not contain this information."
+
+8. Cite factual information using [Source X], where X is the source number provided in the context.
+
+9. Use numbered lists or bullet points when the answer contains multiple items.
+
+10. For Markdown tables using "|" separators:
+    - Treat the first row as the header.
+    - Do not treat the Markdown separator row (such as |---|---|) as data.
+    - If the question asks for the complete table, include every data row provided in the context.
+    - Do not omit or stop early on rows.
+
+IMPORTANT:
+- Use ONLY the provided context.
+- Do not guess.
+- Do not use outside knowledge.
+- Do not omit relevant information.    
+'''
+            ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Context:\n"
+                    f"{context}\n\n"
+                    f"Question: {query}"
                 ),
             },
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
         ]
 
         payload = {
@@ -4575,37 +5000,58 @@ class RAGSystem:
             },
         }
 
+        # with open("payload.json", "w", encoding="utf-8") as f:
+        #     json.dump(payload, f, indent=4, ensure_ascii=False)
+
         url = f"{self.ollama_base_url}/api/chat"
 
-        # Retry logic for Ollama
-        for attempt in range(1, OLLAMA_MAX_RETRIES + 1):
-            try:
-                response = requests.post(
-                    url, json=payload, timeout=120, verify=self.ssl_verify
-                )
-                response.raise_for_status()
-                result = response.json()
-                return result.get("message", {}).get("content", "No response from Ollama.")
-            except requests.exceptions.ConnectionError:
-                if attempt == OLLAMA_MAX_RETRIES:
-                    return (
-                        f"Error: Could not connect to Ollama at {self.ollama_base_url}. "
-                        f"Make sure Ollama is running: 'ollama serve'"
-                    )
-                logger.warning(f"Ollama connection retry {attempt}/{OLLAMA_MAX_RETRIES}...")
-                time.sleep(OLLAMA_RETRY_DELAY * attempt)
-            except requests.exceptions.Timeout:
-                if attempt == OLLAMA_MAX_RETRIES:
-                    return "Error: Ollama request timed out. Try a smaller model or simpler query."
-                logger.warning(f"Ollama timeout retry {attempt}/{OLLAMA_MAX_RETRIES}...")
-                time.sleep(OLLAMA_RETRY_DELAY * attempt)
-            except Exception as e:
-                if attempt == OLLAMA_MAX_RETRIES:
-                    return f"Error generating answer: {e}"
-                logger.warning(f"Ollama error retry {attempt}/{OLLAMA_MAX_RETRIES}: {e}")
-                time.sleep(OLLAMA_RETRY_DELAY * attempt)
+        last_error = None
 
-        return "Error: All Ollama retries exhausted."
+        for attempt in range(1, 4):
+
+            try:
+
+                response = requests.post(
+                    url,
+                    json=payload,
+                    timeout=120,
+                )
+
+                response.raise_for_status()
+
+                result = response.json()
+
+                return result.get(
+                    "message",
+                    {},
+                ).get(
+                    "content",
+                    "No response from Ollama.",
+                )
+
+            except requests.exceptions.ConnectionError as e:
+
+                last_error = e
+
+                if attempt < 3:
+                    time.sleep(attempt)
+
+            except requests.exceptions.Timeout as e:
+
+                last_error = e
+
+                if attempt < 3:
+                    time.sleep(attempt)
+
+            except Exception as e:
+
+                last_error = e
+
+                if attempt < 3:
+                    time.sleep(attempt)
+
+        return f"Error generating answer: {last_error}"
+
 
     # ------------------------------------------------------------------
     # Query Reformulation — make vague queries better for retrieval
@@ -4867,7 +5313,10 @@ class RAGSystem:
             return "No relevant documents found. Please ingest documents first."
 
         # Step 3: Save debug chunks to text file for inspection
-        self._save_debug_chunks(query, chunks, search_query)
+        #self._save_debug_chunks(query, chunks, search_query)
+
+        # with open("output.json", "w", encoding="utf-8") as f:
+        #     json.dump(chunks, f, indent=4, ensure_ascii=False)
 
         # Step 4: Generate answer
         return self.generate_answer(query, chunks)

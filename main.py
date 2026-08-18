@@ -196,7 +196,8 @@ async def query_rag(request: QueryRequest):
         answer = rag.chat(request.question, source_type=request.source_type)
 
         # Get debug info from last retrieval
-        debug = getattr(rag, '_last_retrieval_debug', {})
+        #debug = getattr(rag, '_last_retrieval_debug', {})
+        debug = {}
 
         return QueryResponse(
             answer=answer,
@@ -437,3 +438,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
